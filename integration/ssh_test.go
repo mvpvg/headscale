@@ -2,6 +2,7 @@ package integration
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"testing"
 	"time"
@@ -41,67 +42,90 @@ var retry = func(times int, sleepInterval time.Duration,
 	return result, stderr, err
 }
 
-func TestSSHOneUserAllToAll(t *testing.T) {
-	IntegrationSkip(t)
-	t.Parallel()
-
-	scenario, err := NewScenario()
-	if err != nil {
-		t.Errorf("failed to create scenario: %s", err)
-	}
+func sshScenario(t *testing.T, policy *policy.ACLPolicy, clientsPerUser int) *Scenario {
+	t.Helper()
+	scenario, err := NewScenario(dockertestMaxWait())
+	assertNoErr(t, err)
 
 	spec := map[string]int{
-		"user1": len(TailscaleVersions) - 5,
+		"user1": clientsPerUser,
+		"user2": clientsPerUser,
 	}
 
 	err = scenario.CreateHeadscaleEnv(spec,
-		[]tsic.Option{tsic.WithSSH()},
-		hsic.WithACLPolicy(
-			&policy.ACLPolicy{
-				Groups: map[string][]string{
-					"group:integration-test": {"user1"},
-				},
-				ACLs: []policy.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-				SSHs: []policy.SSH{
-					{
-						Action:       "accept",
-						Sources:      []string{"group:integration-test"},
-						Destinations: []string{"group:integration-test"},
-						Users:        []string{"ssh-it-user"},
-					},
-				},
-			},
-		),
-		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_EXPERIMENTAL_FEATURE_SSH": "1",
-		}),
-	)
-	if err != nil {
-		t.Errorf("failed to create headscale environment: %s", err)
-	}
+		[]tsic.Option{
+			tsic.WithSSH(),
 
-	allClients, err := scenario.ListTailscaleClients()
-	if err != nil {
-		t.Errorf("failed to get clients: %s", err)
-	}
+			// Alpine containers dont have ip6tables set up, which causes
+			// tailscaled to stop configuring the wgengine, causing it
+			// to not configure DNS.
+			tsic.WithNetfilter("off"),
+			tsic.WithDockerEntrypoint([]string{
+				"/bin/sh",
+				"-c",
+				"/bin/sleep 3 ; apk add openssh ; adduser ssh-it-user ; update-ca-certificates ; tailscaled --tun=tsdev",
+			}),
+			tsic.WithDockerWorkdir("/"),
+		},
+		hsic.WithACLPolicy(policy),
+		hsic.WithTestName("ssh"),
+	)
+	assertNoErr(t, err)
 
 	err = scenario.WaitForTailscaleSync()
-	if err != nil {
-		t.Errorf("failed wait for tailscale clients to be in sync: %s", err)
-	}
+	assertNoErr(t, err)
 
 	_, err = scenario.ListTailscaleClientsFQDNs()
-	if err != nil {
-		t.Errorf("failed to get FQDNs: %s", err)
-	}
+	assertNoErr(t, err)
 
-	for _, client := range allClients {
+	return scenario
+}
+
+func TestSSHOneUserToAll(t *testing.T) {
+	IntegrationSkip(t)
+	t.Parallel()
+
+	scenario := sshScenario(t,
+		&policy.ACLPolicy{
+			Groups: map[string][]string{
+				"group:integration-test": {"user1"},
+			},
+			ACLs: []policy.ACL{
+				{
+					Action:       "accept",
+					Sources:      []string{"*"},
+					Destinations: []string{"*:*"},
+				},
+			},
+			SSHs: []policy.SSH{
+				{
+					Action:       "accept",
+					Sources:      []string{"group:integration-test"},
+					Destinations: []string{"*"},
+					Users:        []string{"ssh-it-user"},
+				},
+			},
+		},
+		len(MustTestVersions),
+	)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	allClients, err := scenario.ListTailscaleClients()
+	assertNoErrListClients(t, err)
+
+	user1Clients, err := scenario.ListTailscaleClients("user1")
+	assertNoErrListClients(t, err)
+
+	user2Clients, err := scenario.ListTailscaleClients("user2")
+	assertNoErrListClients(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	assertNoErrSync(t, err)
+
+	_, err = scenario.ListTailscaleClientsFQDNs()
+	assertNoErrListFQDN(t, err)
+
+	for _, client := range user1Clients {
 		for _, peer := range allClients {
 			if client.Hostname() == peer.Hostname() {
 				continue
@@ -111,9 +135,14 @@ func TestSSHOneUserAllToAll(t *testing.T) {
 		}
 	}
 
-	err = scenario.Shutdown()
-	if err != nil {
-		t.Errorf("failed to tear down scenario: %s", err)
+	for _, client := range user2Clients {
+		for _, peer := range allClients {
+			if client.Hostname() == peer.Hostname() {
+				continue
+			}
+
+			assertSSHPermissionDenied(t, client, peer)
+		}
 	}
 }
 
@@ -121,67 +150,42 @@ func TestSSHMultipleUsersAllToAll(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
-	if err != nil {
-		t.Errorf("failed to create scenario: %s", err)
-	}
-
-	spec := map[string]int{
-		"user1": len(TailscaleVersions) - 5,
-		"user2": len(TailscaleVersions) - 5,
-	}
-
-	err = scenario.CreateHeadscaleEnv(spec,
-		[]tsic.Option{tsic.WithSSH()},
-		hsic.WithACLPolicy(
-			&policy.ACLPolicy{
-				Groups: map[string][]string{
-					"group:integration-test": {"user1", "user2"},
-				},
-				ACLs: []policy.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-				SSHs: []policy.SSH{
-					{
-						Action:       "accept",
-						Sources:      []string{"group:integration-test"},
-						Destinations: []string{"group:integration-test"},
-						Users:        []string{"ssh-it-user"},
-					},
+	scenario := sshScenario(t,
+		&policy.ACLPolicy{
+			Groups: map[string][]string{
+				"group:integration-test": {"user1", "user2"},
+			},
+			ACLs: []policy.ACL{
+				{
+					Action:       "accept",
+					Sources:      []string{"*"},
+					Destinations: []string{"*:*"},
 				},
 			},
-		),
-		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_EXPERIMENTAL_FEATURE_SSH": "1",
-		}),
+			SSHs: []policy.SSH{
+				{
+					Action:       "accept",
+					Sources:      []string{"group:integration-test"},
+					Destinations: []string{"group:integration-test"},
+					Users:        []string{"ssh-it-user"},
+				},
+			},
+		},
+		len(MustTestVersions),
 	)
-	if err != nil {
-		t.Errorf("failed to create headscale environment: %s", err)
-	}
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	nsOneClients, err := scenario.ListTailscaleClients("user1")
-	if err != nil {
-		t.Errorf("failed to get clients: %s", err)
-	}
+	assertNoErrListClients(t, err)
 
 	nsTwoClients, err := scenario.ListTailscaleClients("user2")
-	if err != nil {
-		t.Errorf("failed to get clients: %s", err)
-	}
+	assertNoErrListClients(t, err)
 
 	err = scenario.WaitForTailscaleSync()
-	if err != nil {
-		t.Errorf("failed wait for tailscale clients to be in sync: %s", err)
-	}
+	assertNoErrSync(t, err)
 
 	_, err = scenario.ListTailscaleClientsFQDNs()
-	if err != nil {
-		t.Errorf("failed to get FQDNs: %s", err)
-	}
+	assertNoErrListFQDN(t, err)
 
 	testInterUserSSH := func(sourceClients []TailscaleClient, targetClients []TailscaleClient) {
 		for _, client := range sourceClients {
@@ -193,66 +197,38 @@ func TestSSHMultipleUsersAllToAll(t *testing.T) {
 
 	testInterUserSSH(nsOneClients, nsTwoClients)
 	testInterUserSSH(nsTwoClients, nsOneClients)
-
-	err = scenario.Shutdown()
-	if err != nil {
-		t.Errorf("failed to tear down scenario: %s", err)
-	}
 }
 
 func TestSSHNoSSHConfigured(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
-	if err != nil {
-		t.Errorf("failed to create scenario: %s", err)
-	}
-
-	spec := map[string]int{
-		"user1": len(TailscaleVersions) - 5,
-	}
-
-	err = scenario.CreateHeadscaleEnv(spec,
-		[]tsic.Option{tsic.WithSSH()},
-		hsic.WithACLPolicy(
-			&policy.ACLPolicy{
-				Groups: map[string][]string{
-					"group:integration-test": {"user1"},
-				},
-				ACLs: []policy.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-				SSHs: []policy.SSH{},
+	scenario := sshScenario(t,
+		&policy.ACLPolicy{
+			Groups: map[string][]string{
+				"group:integration-test": {"user1"},
 			},
-		),
-		hsic.WithTestName("sshnoneconfigured"),
-		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_EXPERIMENTAL_FEATURE_SSH": "1",
-		}),
+			ACLs: []policy.ACL{
+				{
+					Action:       "accept",
+					Sources:      []string{"*"},
+					Destinations: []string{"*:*"},
+				},
+			},
+			SSHs: []policy.SSH{},
+		},
+		len(MustTestVersions),
 	)
-	if err != nil {
-		t.Errorf("failed to create headscale environment: %s", err)
-	}
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	allClients, err := scenario.ListTailscaleClients()
-	if err != nil {
-		t.Errorf("failed to get clients: %s", err)
-	}
+	assertNoErrListClients(t, err)
 
 	err = scenario.WaitForTailscaleSync()
-	if err != nil {
-		t.Errorf("failed wait for tailscale clients to be in sync: %s", err)
-	}
+	assertNoErrSync(t, err)
 
 	_, err = scenario.ListTailscaleClientsFQDNs()
-	if err != nil {
-		t.Errorf("failed to get FQDNs: %s", err)
-	}
+	assertNoErrListFQDN(t, err)
 
 	for _, client := range allClients {
 		for _, peer := range allClients {
@@ -263,73 +239,45 @@ func TestSSHNoSSHConfigured(t *testing.T) {
 			assertSSHPermissionDenied(t, client, peer)
 		}
 	}
-
-	err = scenario.Shutdown()
-	if err != nil {
-		t.Errorf("failed to tear down scenario: %s", err)
-	}
 }
 
 func TestSSHIsBlockedInACL(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
-	if err != nil {
-		t.Errorf("failed to create scenario: %s", err)
-	}
-
-	spec := map[string]int{
-		"user1": len(TailscaleVersions) - 5,
-	}
-
-	err = scenario.CreateHeadscaleEnv(spec,
-		[]tsic.Option{tsic.WithSSH()},
-		hsic.WithACLPolicy(
-			&policy.ACLPolicy{
-				Groups: map[string][]string{
-					"group:integration-test": {"user1"},
-				},
-				ACLs: []policy.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:80"},
-					},
-				},
-				SSHs: []policy.SSH{
-					{
-						Action:       "accept",
-						Sources:      []string{"group:integration-test"},
-						Destinations: []string{"group:integration-test"},
-						Users:        []string{"ssh-it-user"},
-					},
+	scenario := sshScenario(t,
+		&policy.ACLPolicy{
+			Groups: map[string][]string{
+				"group:integration-test": {"user1"},
+			},
+			ACLs: []policy.ACL{
+				{
+					Action:       "accept",
+					Sources:      []string{"*"},
+					Destinations: []string{"*:80"},
 				},
 			},
-		),
-		hsic.WithTestName("sshisblockedinacl"),
-		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_EXPERIMENTAL_FEATURE_SSH": "1",
-		}),
+			SSHs: []policy.SSH{
+				{
+					Action:       "accept",
+					Sources:      []string{"group:integration-test"},
+					Destinations: []string{"group:integration-test"},
+					Users:        []string{"ssh-it-user"},
+				},
+			},
+		},
+		len(MustTestVersions),
 	)
-	if err != nil {
-		t.Errorf("failed to create headscale environment: %s", err)
-	}
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	allClients, err := scenario.ListTailscaleClients()
-	if err != nil {
-		t.Errorf("failed to get clients: %s", err)
-	}
+	assertNoErrListClients(t, err)
 
 	err = scenario.WaitForTailscaleSync()
-	if err != nil {
-		t.Errorf("failed wait for tailscale clients to be in sync: %s", err)
-	}
+	assertNoErrSync(t, err)
 
 	_, err = scenario.ListTailscaleClientsFQDNs()
-	if err != nil {
-		t.Errorf("failed to get FQDNs: %s", err)
-	}
+	assertNoErrListFQDN(t, err)
 
 	for _, client := range allClients {
 		for _, peer := range allClients {
@@ -340,86 +288,55 @@ func TestSSHIsBlockedInACL(t *testing.T) {
 			assertSSHTimeout(t, client, peer)
 		}
 	}
-
-	err = scenario.Shutdown()
-	if err != nil {
-		t.Errorf("failed to tear down scenario: %s", err)
-	}
 }
 
-func TestSSUserOnlyIsolation(t *testing.T) {
+func TestSSHUserOnlyIsolation(t *testing.T) {
 	IntegrationSkip(t)
 	t.Parallel()
 
-	scenario, err := NewScenario()
-	if err != nil {
-		t.Errorf("failed to create scenario: %s", err)
-	}
-
-	spec := map[string]int{
-		"useracl1": len(TailscaleVersions) - 5,
-		"useracl2": len(TailscaleVersions) - 5,
-	}
-
-	err = scenario.CreateHeadscaleEnv(spec,
-		[]tsic.Option{tsic.WithSSH()},
-		hsic.WithACLPolicy(
-			&policy.ACLPolicy{
-				Groups: map[string][]string{
-					"group:ssh1": {"useracl1"},
-					"group:ssh2": {"useracl2"},
-				},
-				ACLs: []policy.ACL{
-					{
-						Action:       "accept",
-						Sources:      []string{"*"},
-						Destinations: []string{"*:*"},
-					},
-				},
-				SSHs: []policy.SSH{
-					{
-						Action:       "accept",
-						Sources:      []string{"group:ssh1"},
-						Destinations: []string{"group:ssh1"},
-						Users:        []string{"ssh-it-user"},
-					},
-					{
-						Action:       "accept",
-						Sources:      []string{"group:ssh2"},
-						Destinations: []string{"group:ssh2"},
-						Users:        []string{"ssh-it-user"},
-					},
+	scenario := sshScenario(t,
+		&policy.ACLPolicy{
+			Groups: map[string][]string{
+				"group:ssh1": {"user1"},
+				"group:ssh2": {"user2"},
+			},
+			ACLs: []policy.ACL{
+				{
+					Action:       "accept",
+					Sources:      []string{"*"},
+					Destinations: []string{"*:*"},
 				},
 			},
-		),
-		hsic.WithTestName("sshtwouseraclblock"),
-		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_EXPERIMENTAL_FEATURE_SSH": "1",
-		}),
+			SSHs: []policy.SSH{
+				{
+					Action:       "accept",
+					Sources:      []string{"group:ssh1"},
+					Destinations: []string{"group:ssh1"},
+					Users:        []string{"ssh-it-user"},
+				},
+				{
+					Action:       "accept",
+					Sources:      []string{"group:ssh2"},
+					Destinations: []string{"group:ssh2"},
+					Users:        []string{"ssh-it-user"},
+				},
+			},
+		},
+		len(MustTestVersions),
 	)
-	if err != nil {
-		t.Errorf("failed to create headscale environment: %s", err)
-	}
+	defer scenario.ShutdownAssertNoPanics(t)
 
-	ssh1Clients, err := scenario.ListTailscaleClients("useracl1")
-	if err != nil {
-		t.Errorf("failed to get clients: %s", err)
-	}
+	ssh1Clients, err := scenario.ListTailscaleClients("user1")
+	assertNoErrListClients(t, err)
 
-	ssh2Clients, err := scenario.ListTailscaleClients("useracl2")
-	if err != nil {
-		t.Errorf("failed to get clients: %s", err)
-	}
+	ssh2Clients, err := scenario.ListTailscaleClients("user2")
+	assertNoErrListClients(t, err)
 
 	err = scenario.WaitForTailscaleSync()
-	if err != nil {
-		t.Errorf("failed wait for tailscale clients to be in sync: %s", err)
-	}
+	assertNoErrSync(t, err)
 
 	_, err = scenario.ListTailscaleClientsFQDNs()
-	if err != nil {
-		t.Errorf("failed to get FQDNs: %s", err)
-	}
+	assertNoErrListFQDN(t, err)
 
 	for _, client := range ssh1Clients {
 		for _, peer := range ssh2Clients {
@@ -459,11 +376,6 @@ func TestSSUserOnlyIsolation(t *testing.T) {
 
 			assertSSHHostname(t, client, peer)
 		}
-	}
-
-	err = scenario.Shutdown()
-	if err != nil {
-		t.Errorf("failed to tear down scenario: %s", err)
 	}
 }
 
@@ -473,10 +385,13 @@ func doSSH(t *testing.T, client TailscaleClient, peer TailscaleClient) (string, 
 	peerFQDN, _ := peer.FQDN()
 
 	command := []string{
-		"ssh", "-o StrictHostKeyChecking=no", "-o ConnectTimeout=1",
+		"/usr/bin/ssh", "-o StrictHostKeyChecking=no", "-o ConnectTimeout=1",
 		fmt.Sprintf("%s@%s", "ssh-it-user", peerFQDN),
 		"'hostname'",
 	}
+
+	log.Printf("Running from %s to %s", client.Hostname(), peer.Hostname())
+	log.Printf("Command: %s", strings.Join(command, " "))
 
 	return retry(10, 1*time.Second, func() (string, string, error) {
 		return client.Execute(command)
@@ -487,29 +402,30 @@ func assertSSHHostname(t *testing.T, client TailscaleClient, peer TailscaleClien
 	t.Helper()
 
 	result, _, err := doSSH(t, client, peer)
-	assert.NoError(t, err)
+	assertNoErr(t, err)
 
-	assert.Contains(t, peer.ID(), strings.ReplaceAll(result, "\n", ""))
+	assertContains(t, peer.ID(), strings.ReplaceAll(result, "\n", ""))
 }
 
 func assertSSHPermissionDenied(t *testing.T, client TailscaleClient, peer TailscaleClient) {
 	t.Helper()
 
-	result, stderr, err := doSSH(t, client, peer)
-	assert.Error(t, err)
+	result, stderr, _ := doSSH(t, client, peer)
 
 	assert.Empty(t, result)
 
-	assert.Contains(t, stderr, "Permission denied (tailscale)")
+	assertContains(t, stderr, "Permission denied (tailscale)")
 }
 
 func assertSSHTimeout(t *testing.T, client TailscaleClient, peer TailscaleClient) {
 	t.Helper()
 
-	result, stderr, err := doSSH(t, client, peer)
-	assert.NoError(t, err)
+	result, stderr, _ := doSSH(t, client, peer)
 
 	assert.Empty(t, result)
 
-	assert.Contains(t, stderr, "Connection timed out")
+	if !strings.Contains(stderr, "Connection timed out") &&
+		!strings.Contains(stderr, "Operation timed out") {
+		t.Fatalf("connection did not time out")
+	}
 }

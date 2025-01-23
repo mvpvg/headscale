@@ -2,31 +2,26 @@ package db
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
+	"sort"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
+	"tailscale.com/net/tsaddr"
+	"tailscale.com/util/set"
 )
 
 var ErrRouteIsNotAvailable = errors.New("route is not available")
 
-func (hsdb *HSDatabase) GetRoutes() (types.Routes, error) {
+func GetRoutes(tx *gorm.DB) (types.Routes, error) {
 	var routes types.Routes
-	err := hsdb.db.Preload("Machine").Find(&routes).Error
-	if err != nil {
-		return nil, err
-	}
-
-	return routes, nil
-}
-
-func (hsdb *HSDatabase) GetMachineAdvertisedRoutes(machine *types.Machine) (types.Routes, error) {
-	var routes types.Routes
-	err := hsdb.db.
-		Preload("Machine").
-		Where("machine_id = ? AND advertised = true", machine.ID).
+	err := tx.
+		Preload("Node").
+		Preload("Node.User").
 		Find(&routes).Error
 	if err != nil {
 		return nil, err
@@ -35,11 +30,60 @@ func (hsdb *HSDatabase) GetMachineAdvertisedRoutes(machine *types.Machine) (type
 	return routes, nil
 }
 
-func (hsdb *HSDatabase) GetMachineRoutes(m *types.Machine) (types.Routes, error) {
+func getAdvertisedAndEnabledRoutes(tx *gorm.DB) (types.Routes, error) {
 	var routes types.Routes
-	err := hsdb.db.
-		Preload("Machine").
-		Where("machine_id = ?", m.ID).
+	err := tx.
+		Preload("Node").
+		Preload("Node.User").
+		Where("advertised = ? AND enabled = ?", true, true).
+		Find(&routes).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return routes, nil
+}
+
+func getRoutesByPrefix(tx *gorm.DB, pref netip.Prefix) (types.Routes, error) {
+	var routes types.Routes
+	err := tx.
+		Preload("Node").
+		Preload("Node.User").
+		Where("prefix = ?", pref.String()).
+		Find(&routes).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return routes, nil
+}
+
+func GetNodeAdvertisedRoutes(tx *gorm.DB, node *types.Node) (types.Routes, error) {
+	var routes types.Routes
+	err := tx.
+		Preload("Node").
+		Preload("Node.User").
+		Where("node_id = ? AND advertised = true", node.ID).
+		Find(&routes).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return routes, nil
+}
+
+func (hsdb *HSDatabase) GetNodeRoutes(node *types.Node) (types.Routes, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (types.Routes, error) {
+		return GetNodeRoutes(rx, node)
+	})
+}
+
+func GetNodeRoutes(tx *gorm.DB, node *types.Node) (types.Routes, error) {
+	var routes types.Routes
+	err := tx.
+		Preload("Node").
+		Preload("Node.User").
+		Where("node_id = ?", node.ID).
 		Find(&routes).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
@@ -48,9 +92,12 @@ func (hsdb *HSDatabase) GetMachineRoutes(m *types.Machine) (types.Routes, error)
 	return routes, nil
 }
 
-func (hsdb *HSDatabase) GetRoute(id uint64) (*types.Route, error) {
+func GetRoute(tx *gorm.DB, id uint64) (*types.Route, error) {
 	var route types.Route
-	err := hsdb.db.Preload("Machine").First(&route, id).Error
+	err := tx.
+		Preload("Node").
+		Preload("Node.User").
+		First(&route, id).Error
 	if err != nil {
 		return nil, err
 	}
@@ -58,134 +105,210 @@ func (hsdb *HSDatabase) GetRoute(id uint64) (*types.Route, error) {
 	return &route, nil
 }
 
-func (hsdb *HSDatabase) EnableRoute(id uint64) error {
-	route, err := hsdb.GetRoute(id)
+func EnableRoute(tx *gorm.DB, id uint64) (*types.StateUpdate, error) {
+	route, err := GetRoute(tx, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Tailscale requires both IPv4 and IPv6 exit routes to
 	// be enabled at the same time, as per
 	// https://github.com/juanfont/headscale/issues/804#issuecomment-1399314002
 	if route.IsExitRoute() {
-		return hsdb.enableRoutes(
-			&route.Machine,
-			types.ExitRouteV4.String(),
-			types.ExitRouteV6.String(),
+		return enableRoutes(
+			tx,
+			route.Node,
+			tsaddr.AllIPv4(),
+			tsaddr.AllIPv6(),
 		)
 	}
 
-	return hsdb.enableRoutes(&route.Machine, netip.Prefix(route.Prefix).String())
+	return enableRoutes(tx, route.Node, netip.Prefix(route.Prefix))
 }
 
-func (hsdb *HSDatabase) DisableRoute(id uint64) error {
-	route, err := hsdb.GetRoute(id)
+func DisableRoute(tx *gorm.DB,
+	id uint64,
+	isLikelyConnected *xsync.MapOf[types.NodeID, bool],
+) ([]types.NodeID, error) {
+	route, err := GetRoute(tx, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	var routes types.Routes
+	node := route.Node
 
 	// Tailscale requires both IPv4 and IPv6 exit routes to
 	// be enabled at the same time, as per
 	// https://github.com/juanfont/headscale/issues/804#issuecomment-1399314002
+	var update []types.NodeID
 	if !route.IsExitRoute() {
 		route.Enabled = false
-		route.IsPrimary = false
-		err = hsdb.db.Save(route).Error
+		err = tx.Save(route).Error
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		return hsdb.HandlePrimarySubnetFailover()
-	}
+		update, err = failoverRouteTx(tx, isLikelyConnected, route)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		routes, err = GetNodeRoutes(tx, node)
+		if err != nil {
+			return nil, err
+		}
 
-	routes, err := hsdb.GetMachineRoutes(&route.Machine)
-	if err != nil {
-		return err
-	}
+		for i := range routes {
+			if routes[i].IsExitRoute() {
+				routes[i].Enabled = false
+				routes[i].IsPrimary = false
 
-	for i := range routes {
-		if routes[i].IsExitRoute() {
-			routes[i].Enabled = false
-			routes[i].IsPrimary = false
-			err = hsdb.db.Save(&routes[i]).Error
-			if err != nil {
-				return err
+				err = tx.Save(&routes[i]).Error
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
 
-	return hsdb.HandlePrimarySubnetFailover()
+	// If update is empty, it means that one was not created
+	// by failover (as a failover was not necessary), create
+	// one and return to the caller.
+	if update == nil {
+		update = []types.NodeID{node.ID}
+	}
+
+	return update, nil
 }
 
-func (hsdb *HSDatabase) DeleteRoute(id uint64) error {
-	route, err := hsdb.GetRoute(id)
+func (hsdb *HSDatabase) DeleteRoute(
+	id uint64,
+	isLikelyConnected *xsync.MapOf[types.NodeID, bool],
+) ([]types.NodeID, error) {
+	return Write(hsdb.DB, func(tx *gorm.DB) ([]types.NodeID, error) {
+		return DeleteRoute(tx, id, isLikelyConnected)
+	})
+}
+
+func DeleteRoute(
+	tx *gorm.DB,
+	id uint64,
+	isLikelyConnected *xsync.MapOf[types.NodeID, bool],
+) ([]types.NodeID, error) {
+	route, err := GetRoute(tx, id)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	if route.Node == nil {
+		// If the route is not assigned to a node, just delete it,
+		// there are no updates to be sent as no nodes are
+		// dependent on it
+		if err := tx.Unscoped().Delete(&route).Error; err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	var routes types.Routes
+	node := route.Node
 
 	// Tailscale requires both IPv4 and IPv6 exit routes to
 	// be enabled at the same time, as per
 	// https://github.com/juanfont/headscale/issues/804#issuecomment-1399314002
-	if !route.IsExitRoute() {
-		if err := hsdb.db.Unscoped().Delete(&route).Error; err != nil {
-			return err
+	// This means that if we delete a route which is an exit route, delete both.
+	var update []types.NodeID
+	if route.IsExitRoute() {
+		routes, err = GetNodeRoutes(tx, node)
+		if err != nil {
+			return nil, err
 		}
 
-		return hsdb.HandlePrimarySubnetFailover()
-	}
+		var routesToDelete types.Routes
+		for _, r := range routes {
+			if r.IsExitRoute() {
+				routesToDelete = append(routesToDelete, r)
+			}
+		}
 
-	routes, err := hsdb.GetMachineRoutes(&route.Machine)
-	if err != nil {
-		return err
-	}
+		if err := tx.Unscoped().Delete(&routesToDelete).Error; err != nil {
+			return nil, err
+		}
+	} else {
+		update, err = failoverRouteTx(tx, isLikelyConnected, route)
+		if err != nil {
+			return nil, nil
+		}
 
-	routesToDelete := types.Routes{}
-	for _, r := range routes {
-		if r.IsExitRoute() {
-			routesToDelete = append(routesToDelete, r)
+		if err := tx.Unscoped().Delete(&route).Error; err != nil {
+			return nil, err
 		}
 	}
 
-	if err := hsdb.db.Unscoped().Delete(&routesToDelete).Error; err != nil {
-		return err
+	// If update is empty, it means that one was not created
+	// by failover (as a failover was not necessary), create
+	// one and return to the caller.
+	if routes == nil {
+		routes, err = GetNodeRoutes(tx, node)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return hsdb.HandlePrimarySubnetFailover()
+	node.Routes = routes
+
+	if update == nil {
+		update = []types.NodeID{node.ID}
+	}
+
+	return update, nil
 }
 
-func (hsdb *HSDatabase) DeleteMachineRoutes(m *types.Machine) error {
-	routes, err := hsdb.GetMachineRoutes(m)
+func deleteNodeRoutes(tx *gorm.DB, node *types.Node, isLikelyConnected *xsync.MapOf[types.NodeID, bool]) ([]types.NodeID, error) {
+	routes, err := GetNodeRoutes(tx, node)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("getting node routes: %w", err)
 	}
 
+	var changed []types.NodeID
 	for i := range routes {
-		if err := hsdb.db.Unscoped().Delete(&routes[i]).Error; err != nil {
-			return err
+		if err := tx.Unscoped().Delete(&routes[i]).Error; err != nil {
+			return nil, fmt.Errorf("deleting route(%d): %w", &routes[i].ID, err)
+		}
+
+		// TODO(kradalby): This is a bit too aggressive, we could probably
+		// figure out which routes needs to be failed over rather than all.
+		chn, err := failoverRouteTx(tx, isLikelyConnected, &routes[i])
+		if err != nil {
+			return changed, fmt.Errorf("failing over route after delete: %w", err)
+		}
+
+		if chn != nil {
+			changed = append(changed, chn...)
 		}
 	}
 
-	return hsdb.HandlePrimarySubnetFailover()
+	return changed, nil
 }
 
-// isUniquePrefix returns if there is another machine providing the same route already.
-func (hsdb *HSDatabase) isUniquePrefix(route types.Route) bool {
+// isUniquePrefix returns if there is another node providing the same route already.
+func isUniquePrefix(tx *gorm.DB, route types.Route) bool {
 	var count int64
-	hsdb.db.
-		Model(&types.Route{}).
-		Where("prefix = ? AND machine_id != ? AND advertised = ? AND enabled = ?",
-			route.Prefix,
-			route.MachineID,
+	tx.Model(&types.Route{}).
+		Where("prefix = ? AND node_id != ? AND advertised = ? AND enabled = ?",
+			route.Prefix.String(),
+			route.NodeID,
 			true, true).Count(&count)
 
 	return count == 0
 }
 
-func (hsdb *HSDatabase) getPrimaryRoute(prefix netip.Prefix) (*types.Route, error) {
+func getPrimaryRoute(tx *gorm.DB, prefix netip.Prefix) (*types.Route, error) {
 	var route types.Route
-	err := hsdb.db.
-		Preload("Machine").
-		Where("prefix = ? AND advertised = ? AND enabled = ? AND is_primary = ?", types.IPPrefix(prefix), true, true, true).
+	err := tx.
+		Preload("Node").
+		Where("prefix = ? AND advertised = ? AND enabled = ? AND is_primary = ?", prefix.String(), true, true, true).
 		First(&route).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
@@ -198,13 +321,19 @@ func (hsdb *HSDatabase) getPrimaryRoute(prefix netip.Prefix) (*types.Route, erro
 	return &route, nil
 }
 
-// getMachinePrimaryRoutes returns the routes that are enabled and marked as primary (for subnet failover)
+func (hsdb *HSDatabase) GetNodePrimaryRoutes(node *types.Node) (types.Routes, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (types.Routes, error) {
+		return GetNodePrimaryRoutes(rx, node)
+	})
+}
+
+// getNodePrimaryRoutes returns the routes that are enabled and marked as primary (for subnet failover)
 // Exit nodes are not considered for this, as they are never marked as Primary.
-func (hsdb *HSDatabase) GetMachinePrimaryRoutes(m *types.Machine) (types.Routes, error) {
+func GetNodePrimaryRoutes(tx *gorm.DB, node *types.Node) (types.Routes, error) {
 	var routes types.Routes
-	err := hsdb.db.
-		Preload("Machine").
-		Where("machine_id = ? AND advertised = ? AND enabled = ? AND is_primary = ?", m.ID, true, true, true).
+	err := tx.
+		Preload("Node").
+		Where("node_id = ? AND advertised = ? AND enabled = ? AND is_primary = ?", node.ID, true, true, true).
 		Find(&routes).Error
 	if err != nil {
 		return nil, err
@@ -213,34 +342,59 @@ func (hsdb *HSDatabase) GetMachinePrimaryRoutes(m *types.Machine) (types.Routes,
 	return routes, nil
 }
 
-func (hsdb *HSDatabase) ProcessMachineRoutes(machine *types.Machine) error {
+func (hsdb *HSDatabase) SaveNodeRoutes(node *types.Node) (bool, error) {
+	return Write(hsdb.DB, func(tx *gorm.DB) (bool, error) {
+		return SaveNodeRoutes(tx, node)
+	})
+}
+
+// SaveNodeRoutes takes a node and updates the database with
+// the new routes.
+// It returns a bool whether an update should be sent as the
+// saved route impacts nodes.
+func SaveNodeRoutes(tx *gorm.DB, node *types.Node) (bool, error) {
+	sendUpdate := false
+
 	currentRoutes := types.Routes{}
-	err := hsdb.db.Where("machine_id = ?", machine.ID).Find(&currentRoutes).Error
+	err := tx.Where("node_id = ?", node.ID).Find(&currentRoutes).Error
 	if err != nil {
-		return err
+		return sendUpdate, err
 	}
 
 	advertisedRoutes := map[netip.Prefix]bool{}
-	for _, prefix := range machine.HostInfo.RoutableIPs {
+	for _, prefix := range node.Hostinfo.RoutableIPs {
 		advertisedRoutes[prefix] = false
 	}
+
+	log.Trace().
+		Str("node", node.Hostname).
+		Interface("advertisedRoutes", advertisedRoutes).
+		Interface("currentRoutes", currentRoutes).
+		Msg("updating routes")
 
 	for pos, route := range currentRoutes {
 		if _, ok := advertisedRoutes[netip.Prefix(route.Prefix)]; ok {
 			if !route.Advertised {
 				currentRoutes[pos].Advertised = true
-				err := hsdb.db.Save(&currentRoutes[pos]).Error
+				err := tx.Save(&currentRoutes[pos]).Error
 				if err != nil {
-					return err
+					return sendUpdate, err
+				}
+
+				// If a route that is newly "saved" is already
+				// enabled, set sendUpdate to true as it is now
+				// available.
+				if route.Enabled {
+					sendUpdate = true
 				}
 			}
 			advertisedRoutes[netip.Prefix(route.Prefix)] = true
 		} else if route.Advertised {
 			currentRoutes[pos].Advertised = false
 			currentRoutes[pos].Enabled = false
-			err := hsdb.db.Save(&currentRoutes[pos]).Error
+			err := tx.Save(&currentRoutes[pos]).Error
 			if err != nil {
-				return err
+				return sendUpdate, err
 			}
 		}
 	}
@@ -248,193 +402,266 @@ func (hsdb *HSDatabase) ProcessMachineRoutes(machine *types.Machine) error {
 	for prefix, exists := range advertisedRoutes {
 		if !exists {
 			route := types.Route{
-				MachineID:  machine.ID,
-				Prefix:     types.IPPrefix(prefix),
+				NodeID:     node.ID.Uint64(),
+				Prefix:     prefix,
 				Advertised: true,
 				Enabled:    false,
 			}
-			err := hsdb.db.Create(&route).Error
+			err := tx.Create(&route).Error
 			if err != nil {
-				return err
+				return sendUpdate, err
 			}
 		}
+	}
+
+	return sendUpdate, nil
+}
+
+// FailoverNodeRoutesIfNecessary takes a node and checks if the node's route
+// need to be failed over to another host.
+// If needed, the failover will be attempted.
+func FailoverNodeRoutesIfNecessary(
+	tx *gorm.DB,
+	isLikelyConnected *xsync.MapOf[types.NodeID, bool],
+	node *types.Node,
+) (*types.StateUpdate, error) {
+	nodeRoutes, err := GetNodeRoutes(tx, node)
+	if err != nil {
+		return nil, nil
+	}
+
+	changedNodes := make(set.Set[types.NodeID])
+
+nodeRouteLoop:
+	for _, nodeRoute := range nodeRoutes {
+		routes, err := getRoutesByPrefix(tx, netip.Prefix(nodeRoute.Prefix))
+		if err != nil {
+			return nil, fmt.Errorf("getting routes by prefix: %w", err)
+		}
+
+		for _, route := range routes {
+			if route.IsPrimary {
+				// if we have a primary route, and the node is connected
+				// nothing needs to be done.
+				if val, ok := isLikelyConnected.Load(route.Node.ID); ok && val {
+					continue nodeRouteLoop
+				}
+
+				// if not, we need to failover the route
+				failover := failoverRoute(isLikelyConnected, &route, routes)
+				if failover != nil {
+					err := failover.save(tx)
+					if err != nil {
+						return nil, fmt.Errorf("saving failover routes: %w", err)
+					}
+
+					changedNodes.Add(failover.old.Node.ID)
+					changedNodes.Add(failover.new.Node.ID)
+
+					continue nodeRouteLoop
+				}
+			}
+		}
+	}
+
+	chng := changedNodes.Slice()
+	sort.SliceStable(chng, func(i, j int) bool {
+		return chng[i] < chng[j]
+	})
+
+	if len(changedNodes) != 0 {
+		return &types.StateUpdate{
+			Type:        types.StatePeerChanged,
+			ChangeNodes: chng,
+			Message:     "called from db.FailoverNodeRoutesIfNecessary",
+		}, nil
+	}
+
+	return nil, nil
+}
+
+// failoverRouteTx takes a route that is no longer available,
+// this can be either from:
+// - being disabled
+// - being deleted
+// - host going offline
+//
+// and tries to find a new route to take over its place.
+// If the given route was not primary, it returns early.
+func failoverRouteTx(
+	tx *gorm.DB,
+	isLikelyConnected *xsync.MapOf[types.NodeID, bool],
+	r *types.Route,
+) ([]types.NodeID, error) {
+	if r == nil {
+		return nil, nil
+	}
+
+	// This route is not a primary route, and it is not
+	// being served to nodes.
+	if !r.IsPrimary {
+		return nil, nil
+	}
+
+	// We do not have to failover exit nodes
+	if r.IsExitRoute() {
+		return nil, nil
+	}
+
+	routes, err := getRoutesByPrefix(tx, netip.Prefix(r.Prefix))
+	if err != nil {
+		return nil, fmt.Errorf("getting routes by prefix: %w", err)
+	}
+
+	fo := failoverRoute(isLikelyConnected, r, routes)
+	if fo == nil {
+		return nil, nil
+	}
+
+	err = fo.save(tx)
+	if err != nil {
+		return nil, fmt.Errorf("saving failover route: %w", err)
+	}
+
+	log.Trace().
+		Str("hostname", fo.new.Node.Hostname).
+		Msgf("set primary to new route, was: id(%d), host(%s), now: id(%d), host(%s)", fo.old.ID, fo.old.Node.Hostname, fo.new.ID, fo.new.Node.Hostname)
+
+	// Return a list of the machinekeys of the changed nodes.
+	return []types.NodeID{fo.old.Node.ID, fo.new.Node.ID}, nil
+}
+
+type failover struct {
+	old *types.Route
+	new *types.Route
+}
+
+func (f *failover) save(tx *gorm.DB) error {
+	err := tx.Save(f.old).Error
+	if err != nil {
+		return fmt.Errorf("saving old primary: %w", err)
+	}
+
+	err = tx.Save(f.new).Error
+	if err != nil {
+		return fmt.Errorf("saving new primary: %w", err)
 	}
 
 	return nil
 }
 
-func (hsdb *HSDatabase) HandlePrimarySubnetFailover() error {
-	// first, get all the enabled routes
-	var routes types.Routes
-	err := hsdb.db.
-		Preload("Machine").
-		Where("advertised = ? AND enabled = ?", true, true).
-		Find(&routes).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().Err(err).Msg("error getting routes")
+func failoverRoute(
+	isLikelyConnected *xsync.MapOf[types.NodeID, bool],
+	routeToReplace *types.Route,
+	altRoutes types.Routes,
+) *failover {
+	if routeToReplace == nil {
+		return nil
 	}
 
-	routesChanged := false
-	for pos, route := range routes {
-		if route.IsExitRoute() {
+	// This route is not a primary route, and it is not
+	// being served to nodes.
+	if !routeToReplace.IsPrimary {
+		return nil
+	}
+
+	// We do not have to failover exit nodes
+	if routeToReplace.IsExitRoute() {
+		return nil
+	}
+
+	var newPrimary *types.Route
+
+	// Find a new suitable route
+	for idx, route := range altRoutes {
+		if routeToReplace.ID == route.ID {
 			continue
 		}
 
-		if !route.IsPrimary {
-			_, err := hsdb.getPrimaryRoute(netip.Prefix(route.Prefix))
-			if hsdb.isUniquePrefix(route) || errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Info().
-					Str("prefix", netip.Prefix(route.Prefix).String()).
-					Str("machine", route.Machine.GivenName).
-					Msg("Setting primary route")
-				routes[pos].IsPrimary = true
-				err := hsdb.db.Save(&routes[pos]).Error
-				if err != nil {
-					log.Error().Err(err).Msg("error marking route as primary")
-
-					return err
-				}
-
-				routesChanged = true
-
-				continue
-			}
+		if !route.Enabled {
+			continue
 		}
 
-		if route.IsPrimary {
-			if route.Machine.IsOnline() {
-				continue
+		if isLikelyConnected != nil {
+			if val, ok := isLikelyConnected.Load(route.Node.ID); ok && val {
+				newPrimary = &altRoutes[idx]
+				break
 			}
-
-			// machine offline, find a new primary
-			log.Info().
-				Str("machine", route.Machine.Hostname).
-				Str("prefix", netip.Prefix(route.Prefix).String()).
-				Msgf("machine offline, finding a new primary subnet")
-
-			// find a new primary route
-			var newPrimaryRoutes types.Routes
-			err := hsdb.db.
-				Preload("Machine").
-				Where("prefix = ? AND machine_id != ? AND advertised = ? AND enabled = ?",
-					route.Prefix,
-					route.MachineID,
-					true, true).
-				Find(&newPrimaryRoutes).Error
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				log.Error().Err(err).Msg("error finding new primary route")
-
-				return err
-			}
-
-			var newPrimaryRoute *types.Route
-			for pos, r := range newPrimaryRoutes {
-				if r.Machine.IsOnline() {
-					newPrimaryRoute = &newPrimaryRoutes[pos]
-
-					break
-				}
-			}
-
-			if newPrimaryRoute == nil {
-				log.Warn().
-					Str("machine", route.Machine.Hostname).
-					Str("prefix", netip.Prefix(route.Prefix).String()).
-					Msgf("no alternative primary route found")
-
-				continue
-			}
-
-			log.Info().
-				Str("old_machine", route.Machine.Hostname).
-				Str("prefix", netip.Prefix(route.Prefix).String()).
-				Str("new_machine", newPrimaryRoute.Machine.Hostname).
-				Msgf("found new primary route")
-
-			// disable the old primary route
-			routes[pos].IsPrimary = false
-			err = hsdb.db.Save(&routes[pos]).Error
-			if err != nil {
-				log.Error().Err(err).Msg("error disabling old primary route")
-
-				return err
-			}
-
-			// enable the new primary route
-			newPrimaryRoute.IsPrimary = true
-			err = hsdb.db.Save(&newPrimaryRoute).Error
-			if err != nil {
-				log.Error().Err(err).Msg("error enabling new primary route")
-
-				return err
-			}
-
-			routesChanged = true
 		}
 	}
 
-	if routesChanged {
-		hsdb.notifyStateChange()
+	// If a new route was not found/available,
+	// return without an error.
+	// We do not want to update the database as
+	// the one currently marked as primary is the
+	// best we got.
+	if newPrimary == nil {
+		return nil
 	}
 
-	return nil
+	routeToReplace.IsPrimary = false
+	newPrimary.IsPrimary = true
+
+	return &failover{
+		old: routeToReplace,
+		new: newPrimary,
+	}
 }
 
-// EnableAutoApprovedRoutes enables any routes advertised by a machine that match the ACL autoApprovers policy.
 func (hsdb *HSDatabase) EnableAutoApprovedRoutes(
-	aclPolicy *policy.ACLPolicy,
-	machine *types.Machine,
+	polMan policy.PolicyManager,
+	node *types.Node,
 ) error {
-	if len(machine.IPAddresses) == 0 {
-		return nil // This machine has no IPAddresses, so can't possibly match any autoApprovers ACLs
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return EnableAutoApprovedRoutes(tx, polMan, node)
+	})
+}
+
+// EnableAutoApprovedRoutes enables any routes advertised by a node that match the ACL autoApprovers policy.
+func EnableAutoApprovedRoutes(
+	tx *gorm.DB,
+	polMan policy.PolicyManager,
+	node *types.Node,
+) error {
+	if node.IPv4 == nil && node.IPv6 == nil {
+		return nil // This node has no IPAddresses, so can't possibly match any autoApprovers ACLs
 	}
 
-	routes, err := hsdb.GetMachineAdvertisedRoutes(machine)
+	routes, err := GetNodeAdvertisedRoutes(tx, node)
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("machine", machine.Hostname).
-			Msg("Could not get advertised routes for machine")
-
-		return err
+		return fmt.Errorf("getting advertised routes for node(%s %d): %w", node.Hostname, node.ID, err)
 	}
 
-	approvedRoutes := types.Routes{}
+	log.Trace().Interface("routes", routes).Msg("routes for autoapproving")
+
+	var approvedRoutes types.Routes
 
 	for _, advertisedRoute := range routes {
 		if advertisedRoute.Enabled {
 			continue
 		}
 
-		routeApprovers, err := aclPolicy.AutoApprovers.GetRouteApprovers(
-			netip.Prefix(advertisedRoute.Prefix),
-		)
-		if err != nil {
-			log.Err(err).
-				Str("advertisedRoute", advertisedRoute.String()).
-				Uint64("machineId", machine.ID).
-				Msg("Failed to resolve autoApprovers for advertised route")
+		routeApprovers := polMan.ApproversForRoute(netip.Prefix(advertisedRoute.Prefix))
 
-			return err
-		}
+		log.Trace().
+			Str("node", node.Hostname).
+			Uint("user.id", node.User.ID).
+			Strs("routeApprovers", routeApprovers).
+			Str("prefix", netip.Prefix(advertisedRoute.Prefix).String()).
+			Msg("looking up route for autoapproving")
 
 		for _, approvedAlias := range routeApprovers {
-			if approvedAlias == machine.User.Name {
+			if approvedAlias == node.User.Username() {
 				approvedRoutes = append(approvedRoutes, advertisedRoute)
 			} else {
 				// TODO(kradalby): figure out how to get this to depend on less stuff
-				approvedIps, err := aclPolicy.ExpandAlias(types.Machines{*machine}, approvedAlias)
+				approvedIps, err := polMan.ExpandAlias(approvedAlias)
 				if err != nil {
-					log.Err(err).
-						Str("alias", approvedAlias).
-						Msg("Failed to expand alias when processing autoApprovers policy")
-
-					return err
+					return fmt.Errorf("expanding alias %q for autoApprovers: %w", approvedAlias, err)
 				}
 
-				// approvedIPs should contain all of machine's IPs if it matches the rule, so check for first
-				if approvedIps.Contains(machine.IPAddresses[0]) {
+				// approvedIPs should contain all of node's IPs if it matches the rule, so check for first
+				if approvedIps.Contains(*node.IPv4) {
 					approvedRoutes = append(approvedRoutes, advertisedRoute)
 				}
 			}
@@ -442,14 +669,9 @@ func (hsdb *HSDatabase) EnableAutoApprovedRoutes(
 	}
 
 	for _, approvedRoute := range approvedRoutes {
-		err := hsdb.EnableRoute(uint64(approvedRoute.ID))
+		_, err := EnableRoute(tx, uint64(approvedRoute.ID))
 		if err != nil {
-			log.Err(err).
-				Str("approvedRoute", approvedRoute.String()).
-				Uint64("machineId", machine.ID).
-				Msg("Failed to enable approved route")
-
-			return err
+			return fmt.Errorf("enabling approved route(%d): %w", approvedRoute.ID, err)
 		}
 	}
 

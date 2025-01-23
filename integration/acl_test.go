@@ -1,15 +1,18 @@
 package integration
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var veryLargeDestination = []string{
@@ -45,10 +48,14 @@ var veryLargeDestination = []string{
 	"208.0.0.0/4:*",
 }
 
-func aclScenario(t *testing.T, policy *policy.ACLPolicy, clientsPerUser int) *Scenario {
+func aclScenario(
+	t *testing.T,
+	policy *policy.ACLPolicy,
+	clientsPerUser int,
+) *Scenario {
 	t.Helper()
-	scenario, err := NewScenario()
-	assert.NoError(t, err)
+	scenario, err := NewScenario(dockertestMaxWait())
+	require.NoError(t, err)
 
 	spec := map[string]int{
 		"user1": clientsPerUser,
@@ -57,23 +64,24 @@ func aclScenario(t *testing.T, policy *policy.ACLPolicy, clientsPerUser int) *Sc
 
 	err = scenario.CreateHeadscaleEnv(spec,
 		[]tsic.Option{
+			// Alpine containers dont have ip6tables set up, which causes
+			// tailscaled to stop configuring the wgengine, causing it
+			// to not configure DNS.
+			tsic.WithNetfilter("off"),
 			tsic.WithDockerEntrypoint([]string{
-				"/bin/bash",
+				"/bin/sh",
 				"-c",
-				"/bin/sleep 3 ; update-ca-certificates ; python3 -m http.server --bind :: 80 & tailscaled --tun=tsdev",
+				"/bin/sleep 3 ; apk add python3 curl ; update-ca-certificates ; python3 -m http.server --bind :: 80 & tailscaled --tun=tsdev",
 			}),
 			tsic.WithDockerWorkdir("/"),
 		},
 		hsic.WithACLPolicy(policy),
 		hsic.WithTestName("acl"),
 	)
-	assert.NoError(t, err)
-
-	err = scenario.WaitForTailscaleSync()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	_, err = scenario.ListTailscaleClientsFQDNs()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	return scenario
 }
@@ -111,8 +119,8 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 					},
 				},
 			}, want: map[string]int{
-				"user1": 3, // ns1 + ns2
-				"user2": 3, // ns2 + ns1
+				"user1@test.no": 3, // ns1 + ns2
+				"user2@test.no": 3, // ns2 + ns1
 			},
 		},
 		// Test that when we have two users, which cannot see
@@ -137,8 +145,8 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 					},
 				},
 			}, want: map[string]int{
-				"user1": 1,
-				"user2": 1,
+				"user1@test.no": 1,
+				"user2@test.no": 1,
 			},
 		},
 		// Test that when we have two users, with ACLs and they
@@ -173,8 +181,8 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 					},
 				},
 			}, want: map[string]int{
-				"user1": 3,
-				"user2": 3,
+				"user1@test.no": 3,
+				"user2@test.no": 3,
 			},
 		},
 		// Test that when we have two users, that are isolated,
@@ -205,8 +213,8 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 					},
 				},
 			}, want: map[string]int{
-				"user1": 3, // ns1 + ns2
-				"user2": 3, // ns1 + ns2 (return path)
+				"user1@test.no": 3, // ns1 + ns2
+				"user2@test.no": 3, // ns1 + ns2 (return path)
 			},
 		},
 		"very-large-destination-prefix-1372": {
@@ -233,8 +241,8 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 					},
 				},
 			}, want: map[string]int{
-				"user1": 3, // ns1 + ns2
-				"user2": 3, // ns1 + ns2 (return path)
+				"user1@test.no": 3, // ns1 + ns2
+				"user2@test.no": 3, // ns1 + ns2 (return path)
 			},
 		},
 		"ipv6-acls-1470": {
@@ -251,16 +259,16 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 					},
 				},
 			}, want: map[string]int{
-				"user1": 3, // ns1 + ns2
-				"user2": 3, // ns2 + ns1
+				"user1@test.no": 3, // ns1 + ns2
+				"user2@test.no": 3, // ns2 + ns1
 			},
 		},
 	}
 
 	for name, testCase := range tests {
 		t.Run(name, func(t *testing.T) {
-			scenario, err := NewScenario()
-			assert.NoError(t, err)
+			scenario, err := NewScenario(dockertestMaxWait())
+			require.NoError(t, err)
 
 			spec := testCase.users
 
@@ -268,25 +276,23 @@ func TestACLHostsInNetMapTable(t *testing.T) {
 				[]tsic.Option{},
 				hsic.WithACLPolicy(&testCase.policy),
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
+			defer scenario.ShutdownAssertNoPanics(t)
 
 			allClients, err := scenario.ListTailscaleClients()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
-			err = scenario.WaitForTailscaleSync()
-			assert.NoError(t, err)
+			err = scenario.WaitForTailscaleSyncWithPeerCount(testCase.want["user1@test.no"])
+			require.NoError(t, err)
 
 			for _, client := range allClients {
 				status, err := client.Status()
-				assert.NoError(t, err)
+				require.NoError(t, err)
 
 				user := status.User[status.Self.UserID].LoginName
 
-				assert.Equal(t, (testCase.want[user]), len(status.Peer))
+				assert.Len(t, status.Peer, (testCase.want[user]))
 			}
-
-			err = scenario.Shutdown()
-			assert.NoError(t, err)
 		})
 	}
 }
@@ -311,25 +317,26 @@ func TestACLAllowUser80Dst(t *testing.T) {
 		},
 		1,
 	)
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	user1Clients, err := scenario.ListTailscaleClients("user1")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	user2Clients, err := scenario.ListTailscaleClients("user2")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Test that user1 can visit all user2
 	for _, client := range user1Clients {
 		for _, peer := range user2Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Len(t, result, 13)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 		}
 	}
 
@@ -337,19 +344,16 @@ func TestACLAllowUser80Dst(t *testing.T) {
 	for _, client := range user2Clients {
 		for _, peer := range user1Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 		}
 	}
-
-	err = scenario.Shutdown()
-	assert.NoError(t, err)
 }
 
 func TestACLDenyAllPort80(t *testing.T) {
@@ -370,12 +374,13 @@ func TestACLDenyAllPort80(t *testing.T) {
 		},
 		4,
 	)
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	allClients, err := scenario.ListTailscaleClients()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	allHostnames, err := scenario.ListTailscaleClientsFQDNs()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	for _, client := range allClients {
 		for _, hostname := range allHostnames {
@@ -390,12 +395,9 @@ func TestACLDenyAllPort80(t *testing.T) {
 
 			result, err := client.Curl(url)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 		}
 	}
-
-	err = scenario.Shutdown()
-	assert.NoError(t, err)
 }
 
 // Test to confirm that we can use user:* from one user.
@@ -416,25 +418,26 @@ func TestACLAllowUserDst(t *testing.T) {
 		},
 		2,
 	)
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	user1Clients, err := scenario.ListTailscaleClients("user1")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	user2Clients, err := scenario.ListTailscaleClients("user2")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Test that user1 can visit all user2
 	for _, client := range user1Clients {
 		for _, peer := range user2Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Len(t, result, 13)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 		}
 	}
 
@@ -442,19 +445,16 @@ func TestACLAllowUserDst(t *testing.T) {
 	for _, client := range user2Clients {
 		for _, peer := range user1Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 		}
 	}
-
-	err = scenario.Shutdown()
-	assert.NoError(t, err)
 }
 
 // Test to confirm that we can use *:* from one user
@@ -474,25 +474,26 @@ func TestACLAllowStarDst(t *testing.T) {
 		},
 		2,
 	)
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	user1Clients, err := scenario.ListTailscaleClients("user1")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	user2Clients, err := scenario.ListTailscaleClients("user2")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Test that user1 can visit all user2
 	for _, client := range user1Clients {
 		for _, peer := range user2Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Len(t, result, 13)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 		}
 	}
 
@@ -500,19 +501,16 @@ func TestACLAllowStarDst(t *testing.T) {
 	for _, client := range user2Clients {
 		for _, peer := range user1Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 		}
 	}
-
-	err = scenario.Shutdown()
-	assert.NoError(t, err)
 }
 
 // TestACLNamedHostsCanReachBySubnet is the same as
@@ -537,25 +535,26 @@ func TestACLNamedHostsCanReachBySubnet(t *testing.T) {
 		},
 		3,
 	)
+	defer scenario.ShutdownAssertNoPanics(t)
 
 	user1Clients, err := scenario.ListTailscaleClients("user1")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	user2Clients, err := scenario.ListTailscaleClients("user2")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Test that user1 can visit all user2
 	for _, client := range user1Clients {
 		for _, peer := range user2Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Len(t, result, 13)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 		}
 	}
 
@@ -563,19 +562,16 @@ func TestACLNamedHostsCanReachBySubnet(t *testing.T) {
 	for _, client := range user2Clients {
 		for _, peer := range user1Clients {
 			fqdn, err := peer.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
 			t.Logf("url from %s to %s", client.Hostname(), url)
 
 			result, err := client.Curl(url)
 			assert.Len(t, result, 13)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 		}
 	}
-
-	err = scenario.Shutdown()
-	assert.NoError(t, err)
 }
 
 // This test aims to cover cases where individual hosts are allowed and denied
@@ -677,16 +673,17 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				&testCase.policy,
 				2,
 			)
+			defer scenario.ShutdownAssertNoPanics(t)
 
 			// Since user/users dont matter here, we basically expect that some clients
 			// will be assigned these ips and that we can pick them up for our own use.
 			test1ip4 := netip.MustParseAddr("100.64.0.1")
 			test1ip6 := netip.MustParseAddr("fd7a:115c:a1e0::1")
 			test1, err := scenario.FindTailscaleClientByIP(test1ip6)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			test1fqdn, err := test1.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			test1ip4URL := fmt.Sprintf("http://%s/etc/hostname", test1ip4.String())
 			test1ip6URL := fmt.Sprintf("http://[%s]/etc/hostname", test1ip6.String())
 			test1fqdnURL := fmt.Sprintf("http://%s/etc/hostname", test1fqdn)
@@ -694,10 +691,10 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 			test2ip4 := netip.MustParseAddr("100.64.0.2")
 			test2ip6 := netip.MustParseAddr("fd7a:115c:a1e0::2")
 			test2, err := scenario.FindTailscaleClientByIP(test2ip6)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			test2fqdn, err := test2.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			test2ip4URL := fmt.Sprintf("http://%s/etc/hostname", test2ip4.String())
 			test2ip6URL := fmt.Sprintf("http://[%s]/etc/hostname", test2ip6.String())
 			test2fqdnURL := fmt.Sprintf("http://%s/etc/hostname", test2fqdn)
@@ -705,10 +702,10 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 			test3ip4 := netip.MustParseAddr("100.64.0.3")
 			test3ip6 := netip.MustParseAddr("fd7a:115c:a1e0::3")
 			test3, err := scenario.FindTailscaleClientByIP(test3ip6)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			test3fqdn, err := test3.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			test3ip4URL := fmt.Sprintf("http://%s/etc/hostname", test3ip4.String())
 			test3ip6URL := fmt.Sprintf("http://[%s]/etc/hostname", test3ip6.String())
 			test3fqdnURL := fmt.Sprintf("http://%s/etc/hostname", test3fqdn)
@@ -723,7 +720,7 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test3ip4URL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test1.Curl(test3ip6URL)
 			assert.Lenf(
@@ -734,7 +731,7 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test3ip6URL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test1.Curl(test3fqdnURL)
 			assert.Lenf(
@@ -745,7 +742,7 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test3fqdnURL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			// test2 can query test3
 			result, err = test2.Curl(test3ip4URL)
@@ -757,7 +754,7 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test3ip4URL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test2.Curl(test3ip6URL)
 			assert.Lenf(
@@ -768,7 +765,7 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test3ip6URL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test2.Curl(test3fqdnURL)
 			assert.Lenf(
@@ -779,33 +776,33 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test3fqdnURL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			// test3 cannot query test1
 			result, err = test3.Curl(test1ip4URL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test3.Curl(test1ip6URL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test3.Curl(test1fqdnURL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			// test3 cannot query test2
 			result, err = test3.Curl(test2ip4URL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test3.Curl(test2ip6URL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test3.Curl(test2fqdnURL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			// test1 can query test2
 			result, err = test1.Curl(test2ip4URL)
@@ -818,7 +815,7 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				result,
 			)
 
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			result, err = test1.Curl(test2ip6URL)
 			assert.Lenf(
 				t,
@@ -828,7 +825,7 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test2ip6URL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test1.Curl(test2fqdnURL)
 			assert.Lenf(
@@ -839,23 +836,20 @@ func TestACLNamedHostsCanReach(t *testing.T) {
 				test2fqdnURL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			// test2 cannot query test1
 			result, err = test2.Curl(test1ip4URL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test2.Curl(test1ip6URL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test2.Curl(test1fqdnURL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
-
-			err = scenario.Shutdown()
-			assert.NoError(t, err)
+			require.Error(t, err)
 		})
 	}
 }
@@ -953,10 +947,10 @@ func TestACLDevice1CanAccessDevice2(t *testing.T) {
 			test1ip6 := netip.MustParseAddr("fd7a:115c:a1e0::1")
 			test1, err := scenario.FindTailscaleClientByIP(test1ip)
 			assert.NotNil(t, test1)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			test1fqdn, err := test1.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			test1ipURL := fmt.Sprintf("http://%s/etc/hostname", test1ip.String())
 			test1ip6URL := fmt.Sprintf("http://[%s]/etc/hostname", test1ip6.String())
 			test1fqdnURL := fmt.Sprintf("http://%s/etc/hostname", test1fqdn)
@@ -965,10 +959,10 @@ func TestACLDevice1CanAccessDevice2(t *testing.T) {
 			test2ip6 := netip.MustParseAddr("fd7a:115c:a1e0::2")
 			test2, err := scenario.FindTailscaleClientByIP(test2ip)
 			assert.NotNil(t, test2)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			test2fqdn, err := test2.FQDN()
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			test2ipURL := fmt.Sprintf("http://%s/etc/hostname", test2ip.String())
 			test2ip6URL := fmt.Sprintf("http://[%s]/etc/hostname", test2ip6.String())
 			test2fqdnURL := fmt.Sprintf("http://%s/etc/hostname", test2fqdn)
@@ -983,7 +977,7 @@ func TestACLDevice1CanAccessDevice2(t *testing.T) {
 				test2ipURL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test1.Curl(test2ip6URL)
 			assert.Lenf(
@@ -994,7 +988,7 @@ func TestACLDevice1CanAccessDevice2(t *testing.T) {
 				test2ip6URL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test1.Curl(test2fqdnURL)
 			assert.Lenf(
@@ -1005,22 +999,172 @@ func TestACLDevice1CanAccessDevice2(t *testing.T) {
 				test2fqdnURL,
 				result,
 			)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			result, err = test2.Curl(test1ipURL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test2.Curl(test1ip6URL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
+			require.Error(t, err)
 
 			result, err = test2.Curl(test1fqdnURL)
 			assert.Empty(t, result)
-			assert.Error(t, err)
-
-			err = scenario.Shutdown()
-			assert.NoError(t, err)
+			require.Error(t, err)
 		})
+	}
+}
+
+func TestPolicyUpdateWhileRunningWithCLIInDatabase(t *testing.T) {
+	IntegrationSkip(t)
+	t.Parallel()
+
+	scenario, err := NewScenario(dockertestMaxWait())
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	spec := map[string]int{
+		"user1": 1,
+		"user2": 1,
+	}
+
+	err = scenario.CreateHeadscaleEnv(spec,
+		[]tsic.Option{
+			// Alpine containers dont have ip6tables set up, which causes
+			// tailscaled to stop configuring the wgengine, causing it
+			// to not configure DNS.
+			tsic.WithNetfilter("off"),
+			tsic.WithDockerEntrypoint([]string{
+				"/bin/sh",
+				"-c",
+				"/bin/sleep 3 ; apk add python3 curl ; update-ca-certificates ; python3 -m http.server --bind :: 80 & tailscaled --tun=tsdev",
+			}),
+			tsic.WithDockerWorkdir("/"),
+		},
+		hsic.WithTestName("policyreload"),
+		hsic.WithConfigEnv(map[string]string{
+			"HEADSCALE_POLICY_MODE": "database",
+		}),
+	)
+	require.NoError(t, err)
+
+	_, err = scenario.ListTailscaleClientsFQDNs()
+	require.NoError(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	require.NoError(t, err)
+
+	user1Clients, err := scenario.ListTailscaleClients("user1")
+	require.NoError(t, err)
+
+	user2Clients, err := scenario.ListTailscaleClients("user2")
+	require.NoError(t, err)
+
+	all := append(user1Clients, user2Clients...)
+
+	// Initially all nodes can reach each other
+	for _, client := range all {
+		for _, peer := range all {
+			if client.ID() == peer.ID() {
+				continue
+			}
+
+			fqdn, err := peer.FQDN()
+			require.NoError(t, err)
+
+			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
+			t.Logf("url from %s to %s", client.Hostname(), url)
+
+			result, err := client.Curl(url)
+			assert.Len(t, result, 13)
+			require.NoError(t, err)
+		}
+	}
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	p := policy.ACLPolicy{
+		ACLs: []policy.ACL{
+			{
+				Action:       "accept",
+				Sources:      []string{"user1"},
+				Destinations: []string{"user2:*"},
+			},
+		},
+		Hosts: policy.Hosts{},
+	}
+
+	pBytes, _ := json.Marshal(p)
+
+	policyFilePath := "/etc/headscale/policy.json"
+
+	err = headscale.WriteFile(policyFilePath, pBytes)
+	require.NoError(t, err)
+
+	// No policy is present at this time.
+	// Add a new policy from a file.
+	_, err = headscale.Execute(
+		[]string{
+			"headscale",
+			"policy",
+			"set",
+			"-f",
+			policyFilePath,
+		},
+	)
+	require.NoError(t, err)
+
+	// Get the current policy and check
+	// if it is the same as the one we set.
+	var output *policy.ACLPolicy
+	err = executeAndUnmarshal(
+		headscale,
+		[]string{
+			"headscale",
+			"policy",
+			"get",
+			"--output",
+			"json",
+		},
+		&output,
+	)
+	require.NoError(t, err)
+
+	assert.Len(t, output.ACLs, 1)
+
+	if diff := cmp.Diff(p, *output); diff != "" {
+		t.Errorf("unexpected policy(-want +got):\n%s", diff)
+	}
+
+	// Test that user1 can visit all user2
+	for _, client := range user1Clients {
+		for _, peer := range user2Clients {
+			fqdn, err := peer.FQDN()
+			require.NoError(t, err)
+
+			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
+			t.Logf("url from %s to %s", client.Hostname(), url)
+
+			result, err := client.Curl(url)
+			assert.Len(t, result, 13)
+			require.NoError(t, err)
+		}
+	}
+
+	// Test that user2 _cannot_ visit user1
+	for _, client := range user2Clients {
+		for _, peer := range user1Clients {
+			fqdn, err := peer.FQDN()
+			require.NoError(t, err)
+
+			url := fmt.Sprintf("http://%s/etc/hostname", fqdn)
+			t.Logf("url from %s to %s", client.Hostname(), url)
+
+			result, err := client.Curl(url)
+			assert.Empty(t, result)
+			require.Error(t, err)
+		}
 	}
 }

@@ -3,66 +3,47 @@ package mapper
 import (
 	"fmt"
 	"net/netip"
-	"strconv"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/samber/lo"
 	"tailscale.com/tailcfg"
 )
 
 func tailNodes(
-	machines types.Machines,
-	pol *policy.ACLPolicy,
-	dnsConfig *tailcfg.DNSConfig,
-	baseDomain string,
+	nodes types.Nodes,
+	capVer tailcfg.CapabilityVersion,
+	polMan policy.PolicyManager,
+	cfg *types.Config,
 ) ([]*tailcfg.Node, error) {
-	nodes := make([]*tailcfg.Node, len(machines))
+	tNodes := make([]*tailcfg.Node, len(nodes))
 
-	for index, machine := range machines {
+	for index, node := range nodes {
 		node, err := tailNode(
-			machine,
-			pol,
-			dnsConfig,
-			baseDomain,
+			node,
+			capVer,
+			polMan,
+			cfg,
 		)
 		if err != nil {
 			return nil, err
 		}
 
-		nodes[index] = node
+		tNodes[index] = node
 	}
 
-	return nodes, nil
+	return tNodes, nil
 }
 
-// tailNode converts a Machine into a Tailscale Node. includeRoutes is false for shared nodes
-// as per the expected behaviour in the official SaaS.
+// tailNode converts a Node into a Tailscale Node.
 func tailNode(
-	machine types.Machine,
-	pol *policy.ACLPolicy,
-	dnsConfig *tailcfg.DNSConfig,
-	baseDomain string,
+	node *types.Node,
+	capVer tailcfg.CapabilityVersion,
+	polMan policy.PolicyManager,
+	cfg *types.Config,
 ) (*tailcfg.Node, error) {
-	nodeKey, err := machine.NodePublicKey()
-	if err != nil {
-		return nil, err
-	}
-
-	// MachineKey is only used in the legacy protocol
-	machineKey, err := machine.MachinePublicKey()
-	if err != nil {
-		return nil, err
-	}
-
-	discoKey, err := machine.DiscoPublicKey()
-	if err != nil {
-		return nil, err
-	}
-
-	addrs := machine.IPAddresses.Prefixes()
+	addrs := node.Prefixes()
 
 	allowedIPs := append(
 		[]netip.Prefix{},
@@ -70,7 +51,7 @@ func tailNode(
 
 	primaryPrefixes := []netip.Prefix{}
 
-	for _, route := range machine.Routes {
+	for _, route := range node.Routes {
 		if route.Enabled {
 			if route.IsPrimary {
 				allowedIPs = append(allowedIPs, netip.Prefix(route.Prefix))
@@ -82,67 +63,72 @@ func tailNode(
 	}
 
 	var derp string
-	if machine.HostInfo.NetInfo != nil {
-		derp = fmt.Sprintf("127.3.3.40:%d", machine.HostInfo.NetInfo.PreferredDERP)
+	if node.Hostinfo != nil && node.Hostinfo.NetInfo != nil {
+		derp = fmt.Sprintf("127.3.3.40:%d", node.Hostinfo.NetInfo.PreferredDERP)
 	} else {
 		derp = "127.3.3.40:0" // Zero means disconnected or unknown.
 	}
 
 	var keyExpiry time.Time
-	if machine.Expiry != nil {
-		keyExpiry = *machine.Expiry
+	if node.Expiry != nil {
+		keyExpiry = *node.Expiry
 	} else {
 		keyExpiry = time.Time{}
 	}
 
-	hostname, err := machine.GetFQDN(dnsConfig, baseDomain)
+	hostname, err := node.GetFQDN(cfg.BaseDomain)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tailNode, failed to create FQDN: %s", err)
 	}
 
-	hostInfo := machine.GetHostInfo()
+	tags := polMan.Tags(node)
+	tags = lo.Uniq(append(tags, node.ForcedTags...))
 
-	online := machine.IsOnline()
+	tNode := tailcfg.Node{
+		ID:       tailcfg.NodeID(node.ID), // this is the actual ID
+		StableID: node.ID.StableID(),
+		Name:     hostname,
+		Cap:      capVer,
 
-	tags, _ := pol.TagsOfMachine(machine)
-	tags = lo.Uniq(append(tags, machine.ForcedTags...))
+		User: tailcfg.UserID(node.UserID),
 
-	node := tailcfg.Node{
-		ID: tailcfg.NodeID(machine.ID), // this is the actual ID
-		StableID: tailcfg.StableNodeID(
-			strconv.FormatUint(machine.ID, util.Base10),
-		), // in headscale, unlike tailcontrol server, IDs are permanent
-		Name: hostname,
+		Key:       node.NodeKey,
+		KeyExpiry: keyExpiry.UTC(),
 
-		User: tailcfg.UserID(machine.UserID),
-
-		Key:       nodeKey,
-		KeyExpiry: keyExpiry,
-
-		Machine:    machineKey,
-		DiscoKey:   discoKey,
+		Machine:    node.MachineKey,
+		DiscoKey:   node.DiscoKey,
 		Addresses:  addrs,
 		AllowedIPs: allowedIPs,
-		Endpoints:  machine.Endpoints,
+		Endpoints:  node.Endpoints,
 		DERP:       derp,
-		Hostinfo:   hostInfo.View(),
-		Created:    machine.CreatedAt,
+		Hostinfo:   node.Hostinfo.View(),
+		Created:    node.CreatedAt.UTC(),
+
+		Online: node.IsOnline,
 
 		Tags: tags,
 
 		PrimaryRoutes: primaryPrefixes,
 
-		LastSeen:          machine.LastSeen,
-		Online:            &online,
-		KeepAlive:         true,
-		MachineAuthorized: !machine.IsExpired(),
-
-		Capabilities: []string{
-			tailcfg.CapabilityFileSharing,
-			tailcfg.CapabilityAdmin,
-			tailcfg.CapabilitySSH,
-		},
+		MachineAuthorized: !node.IsExpired(),
+		Expired:           node.IsExpired(),
 	}
 
-	return &node, nil
+	tNode.CapMap = tailcfg.NodeCapMap{
+		tailcfg.CapabilityFileSharing: []tailcfg.RawMessage{},
+		tailcfg.CapabilityAdmin:       []tailcfg.RawMessage{},
+		tailcfg.CapabilitySSH:         []tailcfg.RawMessage{},
+	}
+
+	if cfg.RandomizeClientPort {
+		tNode.CapMap[tailcfg.NodeAttrRandomizeClientPort] = []tailcfg.RawMessage{}
+	}
+
+	if node.IsOnline == nil || !*node.IsOnline {
+		// LastSeen is only set when node is
+		// not connected to the control server.
+		tNode.LastSeen = node.LastSeen
+	}
+
+	return &tNode, nil
 }
