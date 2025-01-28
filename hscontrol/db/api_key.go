@@ -46,7 +46,7 @@ func (hsdb *HSDatabase) CreateAPIKey(
 		Expiration: expiration,
 	}
 
-	if err := hsdb.db.Save(&key).Error; err != nil {
+	if err := hsdb.DB.Save(&key).Error; err != nil {
 		return "", nil, fmt.Errorf("failed to save API key to database: %w", err)
 	}
 
@@ -56,7 +56,7 @@ func (hsdb *HSDatabase) CreateAPIKey(
 // ListAPIKeys returns the list of ApiKeys for a user.
 func (hsdb *HSDatabase) ListAPIKeys() ([]types.APIKey, error) {
 	keys := []types.APIKey{}
-	if err := hsdb.db.Find(&keys).Error; err != nil {
+	if err := hsdb.DB.Find(&keys).Error; err != nil {
 		return nil, err
 	}
 
@@ -66,7 +66,7 @@ func (hsdb *HSDatabase) ListAPIKeys() ([]types.APIKey, error) {
 // GetAPIKey returns a ApiKey for a given key.
 func (hsdb *HSDatabase) GetAPIKey(prefix string) (*types.APIKey, error) {
 	key := types.APIKey{}
-	if result := hsdb.db.First(&key, "prefix = ?", prefix); result.Error != nil {
+	if result := hsdb.DB.First(&key, "prefix = ?", prefix); result.Error != nil {
 		return nil, result.Error
 	}
 
@@ -76,7 +76,7 @@ func (hsdb *HSDatabase) GetAPIKey(prefix string) (*types.APIKey, error) {
 // GetAPIKeyByID returns a ApiKey for a given id.
 func (hsdb *HSDatabase) GetAPIKeyByID(id uint64) (*types.APIKey, error) {
 	key := types.APIKey{}
-	if result := hsdb.db.Find(&types.APIKey{ID: id}).First(&key); result.Error != nil {
+	if result := hsdb.DB.Find(&types.APIKey{ID: id}).First(&key); result.Error != nil {
 		return nil, result.Error
 	}
 
@@ -86,7 +86,7 @@ func (hsdb *HSDatabase) GetAPIKeyByID(id uint64) (*types.APIKey, error) {
 // DestroyAPIKey destroys a ApiKey. Returns error if the ApiKey
 // does not exist.
 func (hsdb *HSDatabase) DestroyAPIKey(key types.APIKey) error {
-	if result := hsdb.db.Unscoped().Delete(key); result.Error != nil {
+	if result := hsdb.DB.Unscoped().Delete(key); result.Error != nil {
 		return result.Error
 	}
 
@@ -95,7 +95,7 @@ func (hsdb *HSDatabase) DestroyAPIKey(key types.APIKey) error {
 
 // ExpireAPIKey marks a ApiKey as expired.
 func (hsdb *HSDatabase) ExpireAPIKey(key *types.APIKey) error {
-	if err := hsdb.db.Model(&key).Update("Expiration", time.Now()).Error; err != nil {
+	if err := hsdb.DB.Model(&key).Update("Expiration", time.Now()).Error; err != nil {
 		return err
 	}
 

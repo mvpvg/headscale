@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,33 +39,33 @@ func init() {
 
 	err := registerNodeCmd.MarkFlagRequired("user")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	registerNodeCmd.Flags().StringP("key", "k", "", "Key")
 	err = registerNodeCmd.MarkFlagRequired("key")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(registerNodeCmd)
 
 	expireNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	err = expireNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(expireNodeCmd)
 
 	renameNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	err = renameNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(renameNodeCmd)
 
 	deleteNodeCmd.Flags().Uint64P("identifier", "i", 0, "Node identifier (ID)")
 	err = deleteNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(deleteNodeCmd)
 
@@ -72,7 +73,7 @@ func init() {
 
 	err = moveNodeCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 
 	moveNodeCmd.Flags().StringP("user", "u", "", "New user")
@@ -84,7 +85,7 @@ func init() {
 
 	err = moveNodeCmd.MarkFlagRequired("user")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	nodeCmd.AddCommand(moveNodeCmd)
 
@@ -92,11 +93,13 @@ func init() {
 
 	err = tagCmd.MarkFlagRequired("identifier")
 	if err != nil {
-		log.Fatalf(err.Error())
+		log.Fatal(err.Error())
 	}
 	tagCmd.Flags().
 		StringSliceP("tags", "t", []string{}, "List of tags to add to the node")
 	nodeCmd.AddCommand(tagCmd)
+
+	nodeCmd.AddCommand(backfillNodeIPsCmd)
 }
 
 var nodeCmd = &cobra.Command{
@@ -107,53 +110,47 @@ var nodeCmd = &cobra.Command{
 
 var registerNodeCmd = &cobra.Command{
 	Use:   "register",
-	Short: "Registers a machine to your network",
+	Short: "Registers a node to your network",
 	Run: func(cmd *cobra.Command, args []string) {
 		output, _ := cmd.Flags().GetString("output")
 		user, err := cmd.Flags().GetString("user")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
-		machineKey, err := cmd.Flags().GetString("key")
+		registrationID, err := cmd.Flags().GetString("key")
 		if err != nil {
 			ErrorOutput(
 				err,
 				fmt.Sprintf("Error getting node key from flag: %s", err),
 				output,
 			)
-
-			return
 		}
 
-		request := &v1.RegisterMachineRequest{
-			Key:  machineKey,
+		request := &v1.RegisterNodeRequest{
+			Key:  registrationID,
 			User: user,
 		}
 
-		response, err := client.RegisterMachine(ctx, request)
+		response, err := client.RegisterNode(ctx, request)
 		if err != nil {
 			ErrorOutput(
 				err,
 				fmt.Sprintf(
-					"Cannot register machine: %s\n",
+					"Cannot register node: %s\n",
 					status.Convert(err).Message(),
 				),
 				output,
 			)
-
-			return
 		}
 
 		SuccessOutput(
-			response.Machine,
-			fmt.Sprintf("Machine %s registered", response.Machine.GivenName), output)
+			response.GetNode(),
+			fmt.Sprintf("Node %s registered", response.GetNode().GetGivenName()), output)
 	},
 }
 
@@ -166,46 +163,36 @@ var listNodesCmd = &cobra.Command{
 		user, err := cmd.Flags().GetString("user")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting user: %s", err), output)
-
-			return
 		}
 		showTags, err := cmd.Flags().GetBool("tags")
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error getting tags flag: %s", err), output)
-
-			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
-		request := &v1.ListMachinesRequest{
+		request := &v1.ListNodesRequest{
 			User: user,
 		}
 
-		response, err := client.ListMachines(ctx, request)
+		response, err := client.ListNodes(ctx, request)
 		if err != nil {
 			ErrorOutput(
 				err,
 				fmt.Sprintf("Cannot get nodes: %s", status.Convert(err).Message()),
 				output,
 			)
-
-			return
 		}
 
 		if output != "" {
-			SuccessOutput(response.Machines, "", output)
-
-			return
+			SuccessOutput(response.GetNodes(), "", output)
 		}
 
-		tableData, err := nodesToPtables(user, showTags, response.Machines)
+		tableData, err := nodesToPtables(user, showTags, response.GetNodes())
 		if err != nil {
 			ErrorOutput(err, fmt.Sprintf("Error converting to table: %s", err), output)
-
-			return
 		}
 
 		err = pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
@@ -215,15 +202,13 @@ var listNodesCmd = &cobra.Command{
 				fmt.Sprintf("Failed to render pterm table: %s", err),
 				output,
 			)
-
-			return
 		}
 	},
 }
 
 var expireNodeCmd = &cobra.Command{
 	Use:     "expire",
-	Short:   "Expire (log out) a machine in your network",
+	Short:   "Expire (log out) a node in your network",
 	Long:    "Expiring a node will keep the node in the database and force it to reauthenticate.",
 	Aliases: []string{"logout", "exp", "e"},
 	Run: func(cmd *cobra.Command, args []string) {
@@ -240,20 +225,20 @@ var expireNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
-		request := &v1.ExpireMachineRequest{
-			MachineId: identifier,
+		request := &v1.ExpireNodeRequest{
+			NodeId: identifier,
 		}
 
-		response, err := client.ExpireMachine(ctx, request)
+		response, err := client.ExpireNode(ctx, request)
 		if err != nil {
 			ErrorOutput(
 				err,
 				fmt.Sprintf(
-					"Cannot expire machine: %s\n",
+					"Cannot expire node: %s\n",
 					status.Convert(err).Message(),
 				),
 				output,
@@ -262,13 +247,13 @@ var expireNodeCmd = &cobra.Command{
 			return
 		}
 
-		SuccessOutput(response.Machine, "Machine expired", output)
+		SuccessOutput(response.GetNode(), "Node expired", output)
 	},
 }
 
 var renameNodeCmd = &cobra.Command{
 	Use:   "rename NEW_NAME",
-	Short: "Renames a machine in your network",
+	Short: "Renames a node in your network",
 	Run: func(cmd *cobra.Command, args []string) {
 		output, _ := cmd.Flags().GetString("output")
 
@@ -283,7 +268,7 @@ var renameNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -291,17 +276,17 @@ var renameNodeCmd = &cobra.Command{
 		if len(args) > 0 {
 			newName = args[0]
 		}
-		request := &v1.RenameMachineRequest{
-			MachineId: identifier,
-			NewName:   newName,
+		request := &v1.RenameNodeRequest{
+			NodeId:  identifier,
+			NewName: newName,
 		}
 
-		response, err := client.RenameMachine(ctx, request)
+		response, err := client.RenameNode(ctx, request)
 		if err != nil {
 			ErrorOutput(
 				err,
 				fmt.Sprintf(
-					"Cannot rename machine: %s\n",
+					"Cannot rename node: %s\n",
 					status.Convert(err).Message(),
 				),
 				output,
@@ -310,7 +295,7 @@ var renameNodeCmd = &cobra.Command{
 			return
 		}
 
-		SuccessOutput(response.Machine, "Machine renamed", output)
+		SuccessOutput(response.GetNode(), "Node renamed", output)
 	},
 }
 
@@ -332,15 +317,15 @@ var deleteNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
-		getRequest := &v1.GetMachineRequest{
-			MachineId: identifier,
+		getRequest := &v1.GetNodeRequest{
+			NodeId: identifier,
 		}
 
-		getResponse, err := client.GetMachine(ctx, getRequest)
+		getResponse, err := client.GetNode(ctx, getRequest)
 		if err != nil {
 			ErrorOutput(
 				err,
@@ -354,8 +339,8 @@ var deleteNodeCmd = &cobra.Command{
 			return
 		}
 
-		deleteRequest := &v1.DeleteMachineRequest{
-			MachineId: identifier,
+		deleteRequest := &v1.DeleteNodeRequest{
+			NodeId: identifier,
 		}
 
 		confirm := false
@@ -364,7 +349,7 @@ var deleteNodeCmd = &cobra.Command{
 			prompt := &survey.Confirm{
 				Message: fmt.Sprintf(
 					"Do you want to remove the node %s?",
-					getResponse.GetMachine().Name,
+					getResponse.GetNode().GetName(),
 				),
 			}
 			err = survey.AskOne(prompt, &confirm)
@@ -374,7 +359,7 @@ var deleteNodeCmd = &cobra.Command{
 		}
 
 		if confirm || force {
-			response, err := client.DeleteMachine(ctx, deleteRequest)
+			response, err := client.DeleteNode(ctx, deleteRequest)
 			if output != "" {
 				SuccessOutput(response, "", output)
 
@@ -432,15 +417,15 @@ var moveNodeCmd = &cobra.Command{
 			return
 		}
 
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
-		getRequest := &v1.GetMachineRequest{
-			MachineId: identifier,
+		getRequest := &v1.GetNodeRequest{
+			NodeId: identifier,
 		}
 
-		_, err = client.GetMachine(ctx, getRequest)
+		_, err = client.GetNode(ctx, getRequest)
 		if err != nil {
 			ErrorOutput(
 				err,
@@ -454,12 +439,12 @@ var moveNodeCmd = &cobra.Command{
 			return
 		}
 
-		moveRequest := &v1.MoveMachineRequest{
-			MachineId: identifier,
-			User:      user,
+		moveRequest := &v1.MoveNodeRequest{
+			NodeId: identifier,
+			User:   user,
 		}
 
-		moveResponse, err := client.MoveMachine(ctx, moveRequest)
+		moveResponse, err := client.MoveNode(ctx, moveRequest)
 		if err != nil {
 			ErrorOutput(
 				err,
@@ -473,14 +458,65 @@ var moveNodeCmd = &cobra.Command{
 			return
 		}
 
-		SuccessOutput(moveResponse.Machine, "Node moved to another user", output)
+		SuccessOutput(moveResponse.GetNode(), "Node moved to another user", output)
+	},
+}
+
+var backfillNodeIPsCmd = &cobra.Command{
+	Use:   "backfillips",
+	Short: "Backfill IPs missing from nodes",
+	Long: `
+Backfill IPs can be used to add/remove IPs from nodes
+based on the current configuration of Headscale.
+
+If there are nodes that does not have IPv4 or IPv6
+even if prefixes for both are configured in the config,
+this command can be used to assign IPs of the sort to
+all nodes that are missing.
+
+If you remove IPv4 or IPv6 prefixes from the config,
+it can be run to remove the IPs that should no longer
+be assigned to nodes.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		var err error
+		output, _ := cmd.Flags().GetString("output")
+
+		confirm := false
+		prompt := &survey.Confirm{
+			Message: "Are you sure that you want to assign/remove IPs to/from nodes?",
+		}
+		err = survey.AskOne(prompt, &confirm)
+		if err != nil {
+			return
+		}
+		if confirm {
+			ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
+			defer cancel()
+			defer conn.Close()
+
+			changes, err := client.BackfillNodeIPs(ctx, &v1.BackfillNodeIPsRequest{Confirmed: confirm})
+			if err != nil {
+				ErrorOutput(
+					err,
+					fmt.Sprintf(
+						"Error backfilling IPs: %s",
+						status.Convert(err).Message(),
+					),
+					output,
+				)
+
+				return
+			}
+
+			SuccessOutput(changes, "Node IPs backfilled successfully", output)
+		}
 	},
 }
 
 func nodesToPtables(
 	currentUser string,
 	showTags bool,
-	machines []*v1.Machine,
+	nodes []*v1.Node,
 ) (pterm.TableData, error) {
 	tableHeader := []string{
 		"ID",
@@ -493,7 +529,7 @@ func nodesToPtables(
 		"Ephemeral",
 		"Last seen",
 		"Expiration",
-		"Online",
+		"Connected",
 		"Expired",
 	}
 	if showTags {
@@ -505,23 +541,23 @@ func nodesToPtables(
 	}
 	tableData := pterm.TableData{tableHeader}
 
-	for _, machine := range machines {
+	for _, node := range nodes {
 		var ephemeral bool
-		if machine.PreAuthKey != nil && machine.PreAuthKey.Ephemeral {
+		if node.GetPreAuthKey() != nil && node.GetPreAuthKey().GetEphemeral() {
 			ephemeral = true
 		}
 
 		var lastSeen time.Time
 		var lastSeenTime string
-		if machine.LastSeen != nil {
-			lastSeen = machine.LastSeen.AsTime()
+		if node.GetLastSeen() != nil {
+			lastSeen = node.GetLastSeen().AsTime()
 			lastSeenTime = lastSeen.Format("2006-01-02 15:04:05")
 		}
 
 		var expiry time.Time
 		var expiryTime string
-		if machine.Expiry != nil {
-			expiry = machine.Expiry.AsTime()
+		if node.GetExpiry() != nil {
+			expiry = node.GetExpiry().AsTime()
 			expiryTime = expiry.Format("2006-01-02 15:04:05")
 		} else {
 			expiryTime = "N/A"
@@ -529,7 +565,7 @@ func nodesToPtables(
 
 		var machineKey key.MachinePublic
 		err := machineKey.UnmarshalText(
-			[]byte(util.MachinePublicKeyEnsurePrefix(machine.MachineKey)),
+			[]byte(node.GetMachineKey()),
 		)
 		if err != nil {
 			machineKey = key.MachinePublic{}
@@ -537,14 +573,14 @@ func nodesToPtables(
 
 		var nodeKey key.NodePublic
 		err = nodeKey.UnmarshalText(
-			[]byte(util.NodePublicKeyEnsurePrefix(machine.NodeKey)),
+			[]byte(node.GetNodeKey()),
 		)
 		if err != nil {
 			return nil, err
 		}
 
 		var online string
-		if machine.Online {
+		if node.GetOnline() {
 			online = pterm.LightGreen("online")
 		} else {
 			online = pterm.LightRed("offline")
@@ -558,36 +594,36 @@ func nodesToPtables(
 		}
 
 		var forcedTags string
-		for _, tag := range machine.ForcedTags {
+		for _, tag := range node.GetForcedTags() {
 			forcedTags += "," + tag
 		}
 		forcedTags = strings.TrimLeft(forcedTags, ",")
 		var invalidTags string
-		for _, tag := range machine.InvalidTags {
-			if !contains(machine.ForcedTags, tag) {
+		for _, tag := range node.GetInvalidTags() {
+			if !slices.Contains(node.GetForcedTags(), tag) {
 				invalidTags += "," + pterm.LightRed(tag)
 			}
 		}
 		invalidTags = strings.TrimLeft(invalidTags, ",")
 		var validTags string
-		for _, tag := range machine.ValidTags {
-			if !contains(machine.ForcedTags, tag) {
+		for _, tag := range node.GetValidTags() {
+			if !slices.Contains(node.GetForcedTags(), tag) {
 				validTags += "," + pterm.LightGreen(tag)
 			}
 		}
 		validTags = strings.TrimLeft(validTags, ",")
 
 		var user string
-		if currentUser == "" || (currentUser == machine.User.Name) {
-			user = pterm.LightMagenta(machine.User.Name)
+		if currentUser == "" || (currentUser == node.GetUser().GetName()) {
+			user = pterm.LightMagenta(node.GetUser().GetName())
 		} else {
 			// Shared into this user
-			user = pterm.LightYellow(machine.User.Name)
+			user = pterm.LightYellow(node.GetUser().GetName())
 		}
 
 		var IPV4Address string
 		var IPV6Address string
-		for _, addr := range machine.IpAddresses {
+		for _, addr := range node.GetIpAddresses() {
 			if netip.MustParseAddr(addr).Is4() {
 				IPV4Address = addr
 			} else {
@@ -596,9 +632,9 @@ func nodesToPtables(
 		}
 
 		nodeData := []string{
-			strconv.FormatUint(machine.Id, util.Base10),
-			machine.Name,
-			machine.GetGivenName(),
+			strconv.FormatUint(node.GetId(), util.Base10),
+			node.GetName(),
+			node.GetGivenName(),
 			machineKey.ShortString(),
 			nodeKey.ShortString(),
 			user,
@@ -627,7 +663,7 @@ var tagCmd = &cobra.Command{
 	Aliases: []string{"tags", "t"},
 	Run: func(cmd *cobra.Command, args []string) {
 		output, _ := cmd.Flags().GetString("output")
-		ctx, client, conn, cancel := getHeadscaleCLIClient()
+		ctx, client, conn, cancel := newHeadscaleCLIWithConfig()
 		defer cancel()
 		defer conn.Close()
 
@@ -646,17 +682,17 @@ var tagCmd = &cobra.Command{
 		if err != nil {
 			ErrorOutput(
 				err,
-				fmt.Sprintf("Error retrieving list of tags to add to machine, %v", err),
+				fmt.Sprintf("Error retrieving list of tags to add to node, %v", err),
 				output,
 			)
 
 			return
 		}
 
-		// Sending tags to machine
+		// Sending tags to node
 		request := &v1.SetTagsRequest{
-			MachineId: identifier,
-			Tags:      tagsToSet,
+			NodeId: identifier,
+			Tags:   tagsToSet,
 		}
 		resp, err := client.SetTags(ctx, request)
 		if err != nil {
@@ -671,8 +707,8 @@ var tagCmd = &cobra.Command{
 
 		if resp != nil {
 			SuccessOutput(
-				resp.GetMachine(),
-				"Machine updated",
+				resp.GetNode(),
+				"Node updated",
 				output,
 			)
 		}

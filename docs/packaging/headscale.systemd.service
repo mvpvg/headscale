@@ -9,6 +9,7 @@ Type=simple
 User=headscale
 Group=headscale
 ExecStart=/usr/bin/headscale serve
+ExecReload=/usr/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 
@@ -26,7 +27,6 @@ ProcSubset=pid
 ProtectClock=true
 ProtectControlGroups=true
 ProtectHome=true
-ProtectHome=yes
 ProtectHostname=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
